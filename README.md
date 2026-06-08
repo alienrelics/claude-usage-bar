@@ -1,18 +1,16 @@
 # Claude Usage Bar
 
-A tiny always-on-top Windows desktop widget that shows your **Claude Code session and weekly usage** at a glance.
+A frosted translucent pill pinned above the Windows clock showing Claude Code session and weekly usage — with a breathing live dot.
 
-![Widget](preview.png)
+![Claude Usage Bar in action](example.png)
 
-```
-● S 9%  1h53m    W 98%  53m
-```
+![Icon](preview.png)
 
 | Label | Meaning |
 |-------|---------|
 | **S** | 5-hour session usage % |
 | **W** | 7-day weekly usage % |
-| countdown | time until the window resets |
+| countdown | time until that window resets |
 
 Color thresholds: cream < 75% — amber 75–89% — red ≥ 90%
 
@@ -23,6 +21,7 @@ Color thresholds: cream < 75% — amber 75–89% — red ≥ 90%
 - Windows 10 or 11
 - Python 3.10+
 - [Pillow](https://pypi.org/project/pillow/) (`pip install pillow`)
+- Consolas Bold font (ships with Windows)
 
 ---
 
@@ -30,11 +29,11 @@ Color thresholds: cream < 75% — amber 75–89% — red ≥ 90%
 
 ```bash
 pip install pillow
-python make_icon.py          # generates claude-usage.ico (run once)
-pythonw claude_usage_bar.pyw # launch the widget (no console window)
+python make_icon.py           # generates claude-usage.ico (run once)
+pythonw claude_usage_bar.pyw  # launch — no console window
 ```
 
-The widget appears bottom-right above your clock. Drag it anywhere.
+The pill appears above your clock, top-right. Right-click to refresh or quit.
 
 ---
 
@@ -42,7 +41,7 @@ The widget appears bottom-right above your clock. Drag it anywhere.
 
 1. Press `Win + R` and run: `shell:startup`
 2. Create a shortcut to `claude_usage_bar.pyw` in that folder.
-3. Set the shortcut's icon to `claude-usage.ico` for the proper logo.
+3. Set the shortcut icon to `claude-usage.ico`.
 
 ---
 
@@ -50,15 +49,17 @@ The widget appears bottom-right above your clock. Drag it anywhere.
 
 | Action | Effect |
 |--------|--------|
-| Drag | Move widget anywhere on screen |
 | Right-click | Refresh now / Quit |
-| Auto | Refreshes every 2 minutes |
+| Auto | Refreshes every 2 minutes, countdown ticks live |
+| Crash | Auto-restarts with exponential backoff (5s → 60s max) |
 
 ---
 
 ## How it works
 
-Reads usage data from the Claude API using the same OAuth token that Claude Code stores locally at `~/.claude/.credentials.json`. No extra setup needed — if Claude Code is authenticated, this widget works automatically.
+Reads from the Claude API using the same OAuth token Claude Code stores at `~/.claude/.credentials.json`. No extra setup — if Claude Code is authenticated, this works automatically.
+
+Rendered via `UpdateLayeredWindow` (per-pixel alpha) so the frosted pill looks correct on any desktop background.
 
 ---
 

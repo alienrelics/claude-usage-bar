@@ -1,42 +1,160 @@
 """
-Claude Usage Bar — desktop widget for Windows
-Shows session (5h) and weekly (7d) Claude Code usage percentages
-as a small always-on-top dark pill, pinned bottom-right above the clock.
+Claude Usage Bar — frosted pill HUD for Windows
 
-Drag to move  ·  right-click to refresh or quit  ·  auto-refreshes every 2 min
+A ~34px translucent pill pinned above the Windows clock showing Claude Code
+session (5h) and weekly (7d) usage percentages with a breathing live dot.
+
+Rendered with PIL into a per-pixel-alpha layered window (UpdateLayeredWindow),
+so the frosted pill reads on any background — white, black, or a photo.
 
 Requirements: pip install pillow
 Run with:     pythonw claude_usage_bar.pyw
+Right-click the pill to refresh or quit.
 """
 
+import ctypes
 import json
 import os
 import ssl
+import sys
 import threading
 import time
 import urllib.request
+from ctypes import POINTER, byref, c_int, c_void_p, sizeof, wintypes
 from datetime import datetime, timezone
 from pathlib import Path
-import tkinter as tk
 
-REFRESH = 120   # seconds between API polls
-CRED  = Path.home() / ".claude" / ".credentials.json"
-CACHE = Path(os.environ.get("TEMP", "/tmp")) / "claude-usage-bar-cache.json"
-ICON  = Path(__file__).parent / "claude-usage.ico"
+from PIL import Image, ImageDraw, ImageFont
 
 # ── Palette ────────────────────────────────────────────────────────────
-BG      = "#0e0e14"
-BORDER  = "#2a2a38"
-DOT_OK  = "#5fd38d"
-DOT_ERR = "#f87171"
-LBL_C   = "#6a6a80"
-RST_C   = "#45455a"
-OK_C    = "#f4f1ec"
-WARN_C  = "#ffb066"
-CRIT_C  = "#f87171"
-OFF_C   = "#5a5a6e"
+PILL_BG   = (16, 16, 20, 143)      # rgba(16,16,20,0.56)
+PILL_EDGE = (255, 255, 255, 36)    # rgba(255,255,255,0.14)
+TRACK     = (255, 255, 255, 51)    # rgba(255,255,255,0.20)
+LBL       = (242, 239, 234, 214)
+SHADOW    = (0, 0, 0, 150)
+OK        = (244, 241, 236, 255)   # <75% cream
+WARN      = (255, 176, 102, 255)   # 75-89% amber
+CRIT      = (248, 113, 113, 255)   # >=90% red
+OFF       = (207, 207, 214, 255)
+LIVE      = (95, 211, 141, 255)
+ERRDOT    = (248, 113, 113, 255)
+RST       = (150, 150, 158, 235)
 
-STATE = {"s": 0, "w": 0, "s_iso": None, "w_iso": None, "status": "starting"}
+REFRESH = 120   # seconds between API polls
+TICK    = 1     # seconds between reposition / topmost re-assert
+ANIM_MS = 80    # ms between pulse frames (~12 fps)
+PULSE_S = 1.8   # seconds per full live-dot pulse cycle
+CRED    = Path.home() / ".claude" / ".credentials.json"
+CACHE   = Path(os.environ.get("TEMP", "/tmp")) / "claude-usage-bar-cache.json"
+FONT_B  = "C:/Windows/Fonts/consolab.ttf"
+
+STATE = {"status": "starting", "s": 0, "w": 0, "s_iso": None, "w_iso": None}
+_dirty = threading.Event()
+_dirty.set()
+
+# ── Win32 plumbing ─────────────────────────────────────────────────────
+user32  = ctypes.windll.user32
+gdi32   = ctypes.windll.gdi32
+kernel32 = ctypes.windll.kernel32
+LRESULT = ctypes.c_ssize_t
+
+WS_POPUP        = 0x80000000
+WS_EX_LAYERED   = 0x00080000
+WS_EX_TOPMOST   = 0x00000008
+WS_EX_TOOLWINDOW = 0x00000080
+WS_EX_NOACTIVATE = 0x08000000
+SW_SHOWNA       = 8
+HWND_TOPMOST    = -1
+SWP_NOMOVE      = 0x0002
+SWP_NOSIZE      = 0x0001
+SWP_NOACTIVATE  = 0x0010
+ULW_ALPHA       = 0x02
+WM_RBUTTONUP    = 0x0205
+WM_TIMER        = 0x0113
+WM_DESTROY      = 0x0002
+TPM_RETURNCMD   = 0x0100
+TPM_RIGHTBUTTON = 0x0002
+MF_SEPARATOR    = 0x0800
+
+
+class WNDCLASS(ctypes.Structure):
+    _fields_ = [("style", wintypes.UINT),
+                ("lpfnWndProc", ctypes.c_void_p),
+                ("cbClsExtra", c_int), ("cbWndExtra", c_int),
+                ("hInstance", wintypes.HINSTANCE), ("hIcon", wintypes.HICON),
+                ("hCursor", wintypes.HANDLE), ("hbrBackground", wintypes.HANDLE),
+                ("lpszMenuName", wintypes.LPCWSTR),
+                ("lpszClassName", wintypes.LPCWSTR)]
+
+
+class BITMAPINFOHEADER(ctypes.Structure):
+    _fields_ = [("biSize", wintypes.DWORD), ("biWidth", wintypes.LONG),
+                ("biHeight", wintypes.LONG), ("biPlanes", wintypes.WORD),
+                ("biBitCount", wintypes.WORD), ("biCompression", wintypes.DWORD),
+                ("biSizeImage", wintypes.DWORD), ("biXPelsPerMeter", wintypes.LONG),
+                ("biYPelsPerMeter", wintypes.LONG), ("biClrUsed", wintypes.DWORD),
+                ("biClrImportant", wintypes.DWORD)]
+
+
+class BITMAPINFO(ctypes.Structure):
+    _fields_ = [("bmiHeader", BITMAPINFOHEADER), ("bmiColors", wintypes.DWORD * 3)]
+
+
+class BLENDFUNCTION(ctypes.Structure):
+    _fields_ = [("BlendOp", wintypes.BYTE), ("BlendFlags", wintypes.BYTE),
+                ("SourceConstantAlpha", wintypes.BYTE), ("AlphaFormat", wintypes.BYTE)]
+
+
+WNDPROCTYPE = ctypes.WINFUNCTYPE(LRESULT, wintypes.HWND, wintypes.UINT,
+                                 wintypes.WPARAM, wintypes.LPARAM)
+
+HWND, HDC, HANDLE = wintypes.HWND, wintypes.HDC, wintypes.HANDLE
+DWORD, UINT, BOOL = wintypes.DWORD, wintypes.UINT, wintypes.BOOL
+LPCWSTR = wintypes.LPCWSTR
+
+# Every Win32 call returning/taking a HANDLE must have restype+argtypes set —
+# 64-bit handles overflow ctypes' default c_int otherwise.
+kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+kernel32.GetModuleHandleW.argtypes = [LPCWSTR]
+user32.DefWindowProcW.restype = LRESULT
+user32.DefWindowProcW.argtypes = [HWND, UINT, wintypes.WPARAM, wintypes.LPARAM]
+user32.RegisterClassW.restype = wintypes.ATOM
+user32.RegisterClassW.argtypes = [POINTER(WNDCLASS)]
+user32.CreateWindowExW.restype = HWND
+user32.CreateWindowExW.argtypes = [DWORD, LPCWSTR, LPCWSTR, DWORD, c_int, c_int,
+                                   c_int, c_int, HWND, HANDLE, HANDLE, c_void_p]
+user32.LoadCursorW.restype = HANDLE
+user32.LoadCursorW.argtypes = [HANDLE, c_void_p]
+user32.ShowWindow.argtypes = [HWND, c_int]
+user32.SetTimer.argtypes = [HWND, c_void_p, UINT, c_void_p]
+user32.SetWindowPos.argtypes = [HWND, c_void_p, c_int, c_int, c_int, c_int, UINT]
+user32.DestroyWindow.argtypes = [HWND]
+user32.FindWindowW.restype = HWND
+user32.FindWindowW.argtypes = [LPCWSTR, LPCWSTR]
+user32.GetWindowRect.argtypes = [HWND, POINTER(wintypes.RECT)]
+user32.GetDC.restype = HDC
+user32.GetDC.argtypes = [HWND]
+user32.ReleaseDC.argtypes = [HWND, HDC]
+user32.UpdateLayeredWindow.restype = BOOL
+user32.UpdateLayeredWindow.argtypes = [HWND, HDC, POINTER(wintypes.POINT),
+                                       POINTER(wintypes.SIZE), HDC,
+                                       POINTER(wintypes.POINT), wintypes.COLORREF,
+                                       POINTER(BLENDFUNCTION), DWORD]
+user32.CreatePopupMenu.restype = HANDLE
+user32.AppendMenuW.argtypes = [HANDLE, UINT, ctypes.c_size_t, LPCWSTR]
+user32.TrackPopupMenu.restype = c_int
+user32.TrackPopupMenu.argtypes = [HANDLE, UINT, c_int, c_int, c_int, HWND, c_void_p]
+user32.DestroyMenu.argtypes = [HANDLE]
+user32.SetForegroundWindow.argtypes = [HWND]
+gdi32.CreateCompatibleDC.restype = HDC
+gdi32.CreateCompatibleDC.argtypes = [HDC]
+gdi32.SelectObject.restype = HANDLE
+gdi32.SelectObject.argtypes = [HDC, HANDLE]
+gdi32.DeleteObject.argtypes = [HANDLE]
+gdi32.DeleteDC.argtypes = [HDC]
+gdi32.CreateDIBSection.restype = wintypes.HBITMAP
+gdi32.CreateDIBSection.argtypes = [HDC, POINTER(BITMAPINFO), UINT,
+                                   POINTER(c_void_p), HANDLE, DWORD]
 
 
 # ── Data ───────────────────────────────────────────────────────────────
@@ -54,210 +172,312 @@ def get_token():
 def api_fetch(token):
     req = urllib.request.Request(
         "https://api.anthropic.com/api/oauth/usage",
-        headers={
-            "Authorization": f"Bearer {token}",
-            "anthropic-beta": "oauth-2025-04-20",
-            "Content-Type": "application/json",
-        },
-    )
+        headers={"Authorization": f"Bearer {token}",
+                 "anthropic-beta": "oauth-2025-04-20",
+                 "Content-Type": "application/json"})
     try:
-        ctx = ssl.create_default_context()
-        with urllib.request.urlopen(req, context=ctx, timeout=15) as r:
+        with urllib.request.urlopen(req, context=ssl.create_default_context(),
+                                    timeout=15) as r:
             d = json.loads(r.read().decode())
             with open(CACHE, "w") as f:
                 json.dump({"ts": time.time(), "d": d}, f)
             return d
     except Exception:
-        pass
-    # Fall back to cache (up to 10 min old)
-    try:
-        with open(CACHE) as f:
-            c = json.load(f)
-        if time.time() - c["ts"] < 600:
-            return c["d"]
-    except Exception:
-        pass
+        try:
+            with open(CACHE) as f:
+                c = json.load(f)
+            if time.time() - c["ts"] < 600:
+                return c["d"]
+        except Exception:
+            pass
     return None
 
 
 def countdown(iso):
-    """Return compact time-until string like '55m', '2h30m', '4d3h'."""
     if not iso:
-        return ""
+        return "--"
     try:
-        s = int(
-            (
-                datetime.fromisoformat(iso.replace("Z", "+00:00"))
-                - datetime.now(timezone.utc)
-            ).total_seconds()
-        )
+        s = int((datetime.fromisoformat(iso.replace("Z", "+00:00"))
+                 - datetime.now(timezone.utc)).total_seconds())
         if s <= 0:
             return "now"
         d, s = divmod(s, 86400)
         h, s = divmod(s, 3600)
         m = s // 60
         if d:
-            return f"{d}d{h}h"
+            return f"{d}d {h}h"
         if h:
-            return f"{h}h{m}m"
+            return f"{h}h {m}m"
         return f"{m}m"
     except Exception:
-        return ""
+        return "--"
 
 
-def pct_color(p):
-    if p is None:
-        return OFF_C
-    if p >= 90:
-        return CRIT_C
-    if p >= 75:
-        return WARN_C
-    return OK_C
+def _apply(d):
+    fh = d.get("five_hour") or {}
+    sd = d.get("seven_day") or {}
+    STATE["s"] = round(fh.get("utilization", 0))
+    STATE["w"] = round(sd.get("utilization", 0))
+    STATE["s_iso"] = fh.get("resets_at")
+    STATE["w_iso"] = sd.get("resets_at")
+    STATE["status"] = "ok"
 
 
-# ── Widget ─────────────────────────────────────────────────────────────
-class UsageWidget:
-    W = 282
-    H = 44
-
-    def __init__(self):
-        # Hidden root keeps the window out of the taskbar / Alt+Tab
-        self._root = tk.Tk()
-        self._root.withdraw()
-
-        self.win = tk.Toplevel(self._root)
-        self.win.title("Claude Usage")
-        self.win.overrideredirect(True)
-        self.win.attributes("-topmost", True)
-        self.win.attributes("-alpha", 0.93)
-        self.win.configure(bg=BG)
-        self.win.resizable(False, False)
-
-        if ICON.exists():
-            try:
-                self._root.iconbitmap(str(ICON))
-                self.win.iconbitmap(str(ICON))
-            except Exception:
-                pass
-
-        # Position: bottom-right above taskbar
-        sw = self._root.winfo_screenwidth()
-        sh = self._root.winfo_screenheight()
-        self.win.geometry(f"{self.W}x{self.H}+{sw - self.W - 6}+{sh - self.H - 48}")
-
-        # Layout
-        outer = tk.Frame(self.win, bg=BORDER, padx=1, pady=1)
-        outer.pack(fill="both", expand=True)
-        inner = tk.Frame(outer, bg=BG, padx=10, pady=0)
-        inner.pack(fill="both", expand=True)
-        inner.grid_rowconfigure(0, weight=1)
-
-        self.dot = tk.Label(inner, text="●", fg=DOT_OK, bg=BG, font=("Consolas", 8))
-        self.dot.grid(row=0, column=0, padx=(0, 6))
-
-        tk.Label(inner, text="S", fg=LBL_C, bg=BG,
-                 font=("Consolas", 9, "bold")).grid(row=0, column=1, padx=(0, 3))
-        self.s_val = tk.Label(inner, text="--", fg=OK_C, bg=BG,
-                              font=("Consolas", 13, "bold"))
-        self.s_val.grid(row=0, column=2, padx=(0, 3))
-        self.s_rst = tk.Label(inner, text="", fg=RST_C, bg=BG, font=("Consolas", 8))
-        self.s_rst.grid(row=0, column=3, padx=(0, 12))
-
-        tk.Label(inner, text="W", fg=LBL_C, bg=BG,
-                 font=("Consolas", 9, "bold")).grid(row=0, column=4, padx=(0, 3))
-        self.w_val = tk.Label(inner, text="--", fg=OK_C, bg=BG,
-                              font=("Consolas", 13, "bold"))
-        self.w_val.grid(row=0, column=5, padx=(0, 3))
-        self.w_rst = tk.Label(inner, text="", fg=RST_C, bg=BG, font=("Consolas", 8))
-        self.w_rst.grid(row=0, column=6)
-
-        self._drag_x = self._drag_y = 0
-        for w in self._all_widgets(self.win):
-            w.bind("<ButtonPress-1>", self._drag_start)
-            w.bind("<B1-Motion>", self._drag_move)
-            w.bind("<ButtonRelease-3>", self._show_menu)
-
-        self._menu = tk.Menu(
-            self._root, tearoff=0,
-            bg="#16161f", fg="#c8c8dc",
-            activebackground="#2a2a40", activeforeground="#ffffff",
-            font=("Consolas", 10),
-        )
-        self._menu.add_command(label="Refresh", command=self._refresh_now)
-        self._menu.add_separator()
-        self._menu.add_command(label="Quit", command=self._quit)
-
-        threading.Thread(target=self._poll_loop, daemon=True).start()
-
-    # ── helpers ────────────────────────────────────────────────────────
-    def _all_widgets(self, parent):
-        yield parent
-        for child in parent.winfo_children():
-            yield from self._all_widgets(child)
-
-    def _drag_start(self, e):
-        self._drag_x = e.x_root - self.win.winfo_x()
-        self._drag_y = e.y_root - self.win.winfo_y()
-
-    def _drag_move(self, e):
-        self.win.geometry(f"+{e.x_root - self._drag_x}+{e.y_root - self._drag_y}")
-
-    def _show_menu(self, e):
-        try:
-            self._menu.tk_popup(e.x_root, e.y_root)
-        finally:
-            self._menu.grab_release()
-
-    def _quit(self):
-        self._root.quit()
-
-    # ── data ───────────────────────────────────────────────────────────
-    def _apply_state(self):
-        ok = STATE["status"] == "ok"
-        self.dot.configure(fg=DOT_OK if ok else DOT_ERR)
-        s = STATE["s"] if ok else None
-        w = STATE["w"] if ok else None
-        self.s_val.configure(text=f"{s}%" if s is not None else "--", fg=pct_color(s))
-        self.w_val.configure(text=f"{w}%" if w is not None else "--", fg=pct_color(w))
-        self.s_rst.configure(text=countdown(STATE["s_iso"]) if ok else "")
-        self.w_rst.configure(text=countdown(STATE["w_iso"]) if ok else "")
-
-    def _fetch_once(self):
-        try:
-            tok = get_token()
-            d = api_fetch(tok) if tok else None
-            if d:
-                fh = d.get("five_hour") or {}
-                sd = d.get("seven_day") or {}
-                STATE["s"] = round(fh.get("utilization", 0))
-                STATE["w"] = round(sd.get("utilization", 0))
-                STATE["s_iso"] = fh.get("resets_at")
-                STATE["w_iso"] = sd.get("resets_at")
-                STATE["status"] = "ok"
-            else:
-                STATE["status"] = "offline"
-        except Exception:
+def poll_loop():
+    while True:
+        tok = get_token()
+        d = api_fetch(tok) if tok else None
+        if d:
+            _apply(d)
+        else:
             STATE["status"] = "offline"
-        self._root.after(0, self._apply_state)
+        _dirty.set()
+        time.sleep(REFRESH)
 
-    def _poll_loop(self):
-        while True:
-            self._fetch_once()
-            time.sleep(REFRESH)
 
-    def _refresh_now(self):
-        threading.Thread(target=self._fetch_once, daemon=True).start()
+def level_color(p):
+    if p >= 90:
+        return CRIT
+    if p >= 75:
+        return WARN
+    return OK
 
-    def _tick_countdown(self):
-        if STATE["status"] == "ok":
-            self.s_rst.configure(text=countdown(STATE["s_iso"]))
-            self.w_rst.configure(text=countdown(STATE["w_iso"]))
-        self._root.after(30000, self._tick_countdown)
 
-    def run(self):
-        self._tick_countdown()
-        self._root.mainloop()
+# ── Rendering (PIL → RGBA pill) ────────────────────────────────────────
+SS = 3  # supersample for crisp small text
+_f_lbl = ImageFont.truetype(FONT_B, 10 * SS)
+_f_val = ImageFont.truetype(FONT_B, 13 * SS)
+_f_rst = ImageFont.truetype(FONT_B, 10 * SS)
+_scratch = ImageDraw.Draw(Image.new("RGBA", (4, 4)))
+
+
+def _tw(t, f):
+    return _scratch.textlength(t, font=f)
+
+
+def render():
+    ok = STATE["status"] == "ok"
+    metrics = [("S", STATE["s"] if ok else None, countdown(STATE["s_iso"]) if ok else ""),
+               ("W", STATE["w"] if ok else None, countdown(STATE["w_iso"]) if ok else "")]
+
+    pad, gap, dot_d, ig, rg = (12 * SS, 9 * SS, round(8 * SS * 0.7), 6 * SS, 5 * SS)
+    H = 34 * SS
+
+    def vtext(m):
+        return f"{m}%" if m is not None else "—"
+
+    x = pad + dot_d + gap
+    for i, (lab, m, rst) in enumerate(metrics):
+        x += _tw(lab, _f_lbl) + ig + _tw(vtext(m), _f_val)
+        if rst:
+            x += rg + _tw(rst, _f_rst)
+        if i < len(metrics) - 1:
+            x += gap
+    W = int(x + pad)
+
+    img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle([0, 0, W - 1, H - 1], radius=H // 2,
+                        fill=PILL_BG, outline=PILL_EDGE, width=SS)
+
+    cx = pad
+    cy = H // 2
+
+    dot = LIVE if ok else ERRDOT
+    cxc = cx + dot_d / 2
+    rb = dot_d / 2
+    if ok:
+        for k in range(2):
+            p = ((time.time() / PULSE_S) + k * 0.5) % 1.0
+            R = rb + p * (6 * SS)
+            a = int(130 * (1 - p) ** 1.5)
+            if a > 0:
+                d.ellipse([cxc - R, cy - R, cxc + R, cy + R],
+                          outline=dot[:3] + (a,), width=SS)
+    else:
+        d.ellipse([cx - SS, cy - dot_d // 2 - SS, cx + dot_d + SS, cy + dot_d // 2 + SS],
+                  fill=dot[:3] + (70,))
+    d.ellipse([cx, cy - dot_d // 2, cx + dot_d, cy + dot_d // 2], fill=dot)
+    cx += dot_d + gap
+
+    for i, (lab, m, rst) in enumerate(metrics):
+        col = level_color(m) if m is not None else OFF
+        d.text((cx, cy), lab, font=_f_lbl, fill=LBL, anchor="lm")
+        cx += int(_tw(lab, _f_lbl)) + ig
+        vt = vtext(m)
+        d.text((cx + SS, cy + SS), vt, font=_f_val, fill=SHADOW, anchor="lm")
+        d.text((cx, cy), vt, font=_f_val, fill=col, anchor="lm")
+        cx += int(_tw(vt, _f_val))
+        if rst:
+            cx += rg
+            d.text((cx, cy), rst, font=_f_rst, fill=RST, anchor="lm")
+            cx += int(_tw(rst, _f_rst))
+        if i < len(metrics) - 1:
+            cx += gap
+
+    return img.resize((W // SS, H // SS), Image.LANCZOS)
+
+
+def _premultiplied_bgra(img):
+    b = bytearray(img.tobytes("raw", "BGRA"))
+    for i in range(0, len(b), 4):
+        a = b[i + 3]
+        if a != 255:
+            b[i] = b[i] * a // 255
+            b[i + 1] = b[i + 1] * a // 255
+            b[i + 2] = b[i + 2] * a // 255
+    return bytes(b)
+
+
+def push(hwnd, img, x, y):
+    w, h = img.size
+    raw = _premultiplied_bgra(img)
+    hdc_screen = user32.GetDC(0)
+    hdc_mem = gdi32.CreateCompatibleDC(hdc_screen)
+    bmi = BITMAPINFO()
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER)
+    bmi.bmiHeader.biWidth = w
+    bmi.bmiHeader.biHeight = -h
+    bmi.bmiHeader.biPlanes = 1
+    bmi.bmiHeader.biBitCount = 32
+    bmi.bmiHeader.biCompression = 0
+    ppv = c_void_p()
+    hbmp = gdi32.CreateDIBSection(hdc_mem, byref(bmi), 0, byref(ppv), None, 0)
+    ctypes.memmove(ppv, raw, len(raw))
+    old = gdi32.SelectObject(hdc_mem, hbmp)
+    size = wintypes.SIZE(w, h)
+    psrc = wintypes.POINT(0, 0)
+    pdst = wintypes.POINT(x, y)
+    blend = BLENDFUNCTION(0, 0, 255, 1)
+    user32.UpdateLayeredWindow(hwnd, hdc_screen, byref(pdst), byref(size),
+                               hdc_mem, byref(psrc), 0, byref(blend), ULW_ALPHA)
+    gdi32.SelectObject(hdc_mem, old)
+    gdi32.DeleteObject(hbmp)
+    gdi32.DeleteDC(hdc_mem)
+    user32.ReleaseDC(0, hdc_screen)
+
+
+def clock_pos(w, h):
+    tray = user32.FindWindowW("Shell_TrayWnd", None)
+    if tray:
+        tr = wintypes.RECT()
+        user32.GetWindowRect(tray, byref(tr))
+        return tr.right - w - 2, tr.top - h - 2
+    return 100, 100
+
+
+# ── Window + message loop ──────────────────────────────────────────────
+_HWND = None
+_last_img = None
+
+
+def show_menu(hwnd):
+    menu = user32.CreatePopupMenu()
+    user32.AppendMenuW(menu, 0, 1, "Refresh now")
+    user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
+    user32.AppendMenuW(menu, 0, 2, "Quit")
+    pt = wintypes.POINT()
+    user32.GetCursorPos(byref(pt))
+    user32.SetForegroundWindow(hwnd)
+    cmd = user32.TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                                pt.x, pt.y, 0, hwnd, None)
+    user32.DestroyMenu(menu)
+    if cmd == 1:
+        _dirty.set()
+        threading.Thread(target=_one_shot_fetch, daemon=True).start()
+    elif cmd == 2:
+        user32.DestroyWindow(hwnd)
+
+
+def _one_shot_fetch():
+    tok = get_token()
+    d = api_fetch(tok) if tok else None
+    if d:
+        _apply(d)
+    else:
+        STATE["status"] = "offline"
+    _dirty.set()
+
+
+def _animate():
+    global _last_img
+    _last_img = render()
+    x, y = clock_pos(*_last_img.size)
+    push(_HWND, _last_img, x, y)
+
+
+def _refresh():
+    _animate()
+    _dirty.clear()
+    user32.SetWindowPos(_HWND, HWND_TOPMOST, 0, 0, 0, 0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+
+
+def wndproc(hwnd, msg, wp, lp):
+    if msg == WM_RBUTTONUP:
+        show_menu(hwnd)
+        return 0
+    if msg == WM_TIMER:
+        if wp == 2:
+            _animate()
+        else:
+            _refresh()
+        return 0
+    if msg == WM_DESTROY:
+        global _QUIT_REQUESTED
+        _QUIT_REQUESTED = True
+        user32.PostQuitMessage(0)
+        return 0
+    return user32.DefWindowProcW(hwnd, msg, wp, lp)
+
+
+_WNDPROC = WNDPROCTYPE(wndproc)
+_QUIT_REQUESTED = False
+
+
+def main():
+    global _HWND
+    hinst = kernel32.GetModuleHandleW(None)
+    wc = WNDCLASS()
+    wc.lpfnWndProc = ctypes.cast(_WNDPROC, ctypes.c_void_p)
+    wc.hInstance = hinst
+    wc.hCursor = user32.LoadCursorW(0, 32512)
+    wc.lpszClassName = "ClaudeUsageHUD"
+    result = user32.RegisterClassW(byref(wc))
+    if not result:
+        err = kernel32.GetLastError()
+        if err != 1410:  # ERROR_CLASS_ALREADY_EXISTS — ok on self-restart
+            raise ctypes.WinError(err)
+
+    _HWND = user32.CreateWindowExW(
+        WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        "ClaudeUsageHUD", "Claude usage", WS_POPUP,
+        100, 100, 10, 10, None, None, hinst, None)
+
+    threading.Thread(target=poll_loop, daemon=True).start()
+    _refresh()
+    user32.ShowWindow(_HWND, SW_SHOWNA)
+    user32.SetTimer(_HWND, 1, TICK * 1000, None)
+    user32.SetTimer(_HWND, 2, ANIM_MS, None)
+
+    msg = wintypes.MSG()
+    while user32.GetMessageW(byref(msg), None, 0, 0) > 0:
+        user32.TranslateMessage(byref(msg))
+        user32.DispatchMessageW(byref(msg))
 
 
 if __name__ == "__main__":
-    UsageWidget().run()
+    _mutex = kernel32.CreateMutexW(None, False, "claude-usage-bar-singleton")
+    if kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+        sys.exit(0)
+    _delay = 5
+    while True:
+        _QUIT_REQUESTED = False
+        try:
+            main()
+        except Exception:
+            pass
+        if _QUIT_REQUESTED:
+            break
+        time.sleep(_delay)
+        _delay = min(_delay * 2, 60)
